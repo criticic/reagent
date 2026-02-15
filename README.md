@@ -2,6 +2,8 @@
 
 The autonomous AI agent for binary analysis and vulnerability research.
 
+<video src="demo.mp4" controls width="100%"></video>
+
 reagent combines LLM reasoning with specialist sub-agents that operate industry-standard reverse engineering tools in real-time. You give it a binary and a goal — it triages, decompiles, debugs, and delivers structured findings.
 
 ## How It Works
