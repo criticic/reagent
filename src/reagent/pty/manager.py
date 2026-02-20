@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Callable, TYPE_CHECKING
 
 from reagent.pty.session import PTYSession
+
+if TYPE_CHECKING:
+    from reagent.session.wire import Wire
 
 logger = logging.getLogger(__name__)
 
@@ -17,12 +20,14 @@ class PTYManager:
     - Sessions are tracked and can be looked up by ID
     - All sessions are killed on cleanup (no orphan processes)
     - Session limits are enforced
+    - Exit notifications are fired via Wire (if attached)
     """
 
     MAX_SESSIONS = 10
 
-    def __init__(self) -> None:
+    def __init__(self, wire: Wire | None = None) -> None:
         self._sessions: dict[str, PTYSession] = {}
+        self._wire = wire
 
     async def spawn(
         self,
@@ -54,6 +59,18 @@ class PTYManager:
             env=env or {},
             title=title,
         )
+
+        # Wire up exit notification
+        if self._wire:
+            wire = self._wire
+
+            def _on_exit(s: PTYSession, exit_code: int | None) -> None:
+                tail = s.buffer.read_tail(3)
+                last_output = "\n".join(tail) if tail else ""
+                wire.send_pty_exit(s.id, s.title, exit_code, last_output)
+
+            session.set_on_exit(_on_exit)
+
         await session.start()
         self._sessions[session.id] = session
         return session
@@ -76,6 +93,7 @@ class PTYManager:
                 "title": s.title,
                 "command": " ".join(s.command),
                 "alive": s.alive,
+                "status": s.status.value,
                 "lines": s.buffer.line_count,
             }
             for s in self._sessions.values()

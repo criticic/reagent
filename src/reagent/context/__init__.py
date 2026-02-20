@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+import aiofiles
 
 from reagent.llm.message import (
     Message,
@@ -16,6 +19,9 @@ from reagent.llm.message import (
     ToolCallPart,
     ToolResultPart,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -104,14 +110,15 @@ class Context:
         if not path.exists():
             return ctx
 
-        with open(path, "r") as f:
-            for line in f:
+        async with aiofiles.open(path, "r", encoding="utf-8") as f:
+            async for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 try:
                     data = json.loads(line)
                 except json.JSONDecodeError:
+                    logger.warning("Skipping malformed JSONL line in %s", path)
                     continue
 
                 if data.get("_type") == "checkpoint":
@@ -128,16 +135,30 @@ class Context:
 
     async def _append_jsonl(self, data: dict) -> None:
         """Append a JSON line to the context file."""
-        with open(self.path, "a") as f:
-            f.write(json.dumps(data, ensure_ascii=False) + "\n")
+        async with aiofiles.open(self.path, "a", encoding="utf-8") as f:
+            await f.write(json.dumps(data, ensure_ascii=False) + "\n")
+
+    async def rewrite(self) -> None:
+        """Rewrite the JSONL file from current in-memory state.
+
+        Public interface for ``compact_context()`` and other callers
+        that mutate ``self.messages`` in-place and need to persist.
+        """
+        await self._rewrite_jsonl()
 
     async def _rewrite_jsonl(self) -> None:
-        """Rewrite the entire JSONL file from current state."""
-        with open(self.path, "w") as f:
+        """Rewrite the entire JSONL file from current state.
+
+        Also used by ``context.management.compact_context()`` to persist
+        compacted context.
+        """
+        async with aiofiles.open(self.path, "w", encoding="utf-8") as f:
             for msg in self.messages:
-                f.write(json.dumps(_message_to_dict(msg), ensure_ascii=False) + "\n")
+                await f.write(
+                    json.dumps(_message_to_dict(msg), ensure_ascii=False) + "\n"
+                )
             for cid, idx in sorted(self.checkpoints.items()):
-                f.write(json.dumps({"_type": "checkpoint", "id": cid}) + "\n")
+                await f.write(json.dumps({"_type": "checkpoint", "id": cid}) + "\n")
 
 
 def _message_to_dict(msg: Message) -> dict[str, Any]:

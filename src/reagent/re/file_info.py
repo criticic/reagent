@@ -4,14 +4,91 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, ClassVar
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import lief
 from pydantic import BaseModel, Field
 
 from reagent.tool.base import BaseTool, ToolError, ToolOk, ToolResult
 
+if TYPE_CHECKING:
+    from reagent.model.binary import BinaryModel
+    from reagent.session.wire import Wire
+
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Shared ELF security feature detection
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ELFSecurityInfo:
+    """ELF security feature detection results."""
+
+    pie: bool = False
+    nx: bool = False
+    has_relro: bool = False
+    full_relro: bool = False
+    canary: bool = False
+    fortified: list[str] = field(default_factory=list)
+
+    @property
+    def relro_str(self) -> str:
+        if self.full_relro:
+            return "Full"
+        if self.has_relro:
+            return "Partial"
+        return "No"
+
+
+def _detect_elf_security(binary: Any) -> ELFSecurityInfo:
+    """Detect ELF security features from a LIEF binary object.
+
+    Shared by ``_format_elf()`` (display) and ``_update_target()``
+    (model population) to avoid duplicated logic.
+    """
+    info = ELFSecurityInfo()
+    info.pie = binary.is_pie
+
+    # NX (check PT_GNU_STACK)
+    for seg in binary.segments:
+        seg_type = str(seg.type).split(".")[-1]
+        if seg_type == "GNU_STACK":
+            info.nx = not bool(seg.flags & 1)  # PF_X = 1
+            break
+
+    # RELRO
+    for seg in binary.segments:
+        seg_type = str(seg.type).split(".")[-1]
+        if seg_type == "GNU_RELRO":
+            info.has_relro = True
+            break
+    if info.has_relro:
+        try:
+            for entry in binary.dynamic_entries:
+                entry_tag = str(entry.tag).split(".")[-1]
+                if entry_tag in ("BIND_NOW", "FLAGS") and "NOW" in str(entry):
+                    info.full_relro = True
+                    break
+        except Exception:
+            pass
+
+    # Stack canary
+    info.canary = any(
+        "stack_chk" in str(sym.name).lower() for sym in binary.imported_symbols
+    )
+
+    # FORTIFY
+    info.fortified = [
+        str(sym.name)
+        for sym in binary.imported_symbols
+        if "_chk" in str(sym.name) and "stack" not in str(sym.name).lower()
+    ]
+
+    return info
 
 
 class FileInfoParams(BaseModel):
@@ -40,8 +117,8 @@ class FileInfoTool(BaseTool[FileInfoParams]):
     def __init__(
         self,
         binary_path: str = "",
-        binary_model: Any = None,
-        wire: Any = None,
+        binary_model: BinaryModel | None = None,
+        wire: Wire | None = None,
     ) -> None:
         self._binary_path = binary_path
         self._binary_model = binary_model
@@ -108,58 +185,15 @@ class FileInfoTool(BaseTool[FileInfoParams]):
         lines.append(f"Endian: {endian}")
         lines.append(f"Entry point: 0x{header.entrypoint:x}")
 
-        # Security features
+        # Security features (shared detection)
+        sec = _detect_elf_security(binary)
         lines.append("")
         lines.append("== Security Features ==")
-
-        # PIE
-        is_pie = binary.is_pie
-        lines.append(f"PIE: {'Yes' if is_pie else 'No'}")
-
-        # NX (check PT_GNU_STACK)
-        has_nx = False
-        for seg in binary.segments:
-            seg_type = str(seg.type).split(".")[-1]
-            if seg_type == "GNU_STACK":
-                # If the segment is not executable, NX is enabled
-                has_nx = not bool(seg.flags & 1)  # PF_X = 1
-                break
-        lines.append(f"NX: {'Yes' if has_nx else 'No'}")
-
-        # RELRO
-        has_relro = False
-        full_relro = False
-        for seg in binary.segments:
-            seg_type = str(seg.type).split(".")[-1]
-            if seg_type == "GNU_RELRO":
-                has_relro = True
-                break
-        if has_relro:
-            # Full RELRO also requires BIND_NOW
-            try:
-                for entry in binary.dynamic_entries:
-                    entry_tag = str(entry.tag).split(".")[-1]
-                    if entry_tag in ("BIND_NOW", "FLAGS") and "NOW" in str(entry):
-                        full_relro = True
-                        break
-            except Exception:
-                pass
-        relro_str = "Full" if full_relro else ("Partial" if has_relro else "No")
-        lines.append(f"RELRO: {relro_str}")
-
-        # Stack canary (check for __stack_chk_fail import)
-        has_canary = any(
-            "stack_chk" in str(sym.name).lower() for sym in binary.imported_symbols
-        )
-        lines.append(f"Stack Canary: {'Yes' if has_canary else 'No'}")
-
-        # FORTIFY (check for _chk suffix in imports)
-        fortified = [
-            str(sym.name)
-            for sym in binary.imported_symbols
-            if "_chk" in str(sym.name) and "stack" not in str(sym.name).lower()
-        ]
-        lines.append(f"FORTIFY: {'Yes' if fortified else 'No'}")
+        lines.append(f"PIE: {'Yes' if sec.pie else 'No'}")
+        lines.append(f"NX: {'Yes' if sec.nx else 'No'}")
+        lines.append(f"RELRO: {sec.relro_str}")
+        lines.append(f"Stack Canary: {'Yes' if sec.canary else 'No'}")
+        lines.append(f"FORTIFY: {'Yes' if sec.fortified else 'No'}")
 
         # Sections summary
         lines.append("")
@@ -255,11 +289,11 @@ class FileInfoTool(BaseTool[FileInfoParams]):
             lines.append("== Imports ==")
             for imp in binary.imports:
                 lines.append(f"  {imp.name}:")
-                entries = list(imp.entries)[:20]
-                for entry in entries:
+                all_entries = list(imp.entries)
+                for entry in all_entries[:20]:
                     if entry.name:
                         lines.append(f"    {entry.name}")
-                remaining = len(list(imp.entries)) - 20
+                remaining = len(all_entries) - 20
                 if remaining > 0:
                     lines.append(f"    ... and {remaining} more")
 
@@ -376,35 +410,19 @@ class FileInfoTool(BaseTool[FileInfoParams]):
                     "little" if "LSB" in str(header.identity_data) else "big"
                 )
                 target.bits = 64 if "CLASS64" in str(header.identity_class) else 32
-                target.pie = binary.is_pie
                 target.stripped = not any(
                     str(s.type).split(".")[-1] == "SYMTAB" for s in binary.sections
                 )
-                # NX
-                for seg in binary.segments:
-                    if "GNU_STACK" in str(seg.type):
-                        target.nx = not bool(seg.flags & 1)
-                        break
-                # Canary
-                target.canary = any(
-                    "stack_chk" in str(sym.name).lower()
-                    for sym in binary.imported_symbols
+                # Security features (shared detection)
+                sec = _detect_elf_security(binary)
+                target.pie = sec.pie
+                target.nx = sec.nx
+                target.canary = sec.canary
+                target.relro = (
+                    "full"
+                    if sec.full_relro
+                    else ("partial" if sec.has_relro else "none")
                 )
-                # RELRO
-                has_relro = any("GNU_RELRO" in str(seg.type) for seg in binary.segments)
-                if has_relro:
-                    target.relro = "partial"
-                    try:
-                        for entry in binary.dynamic_entries:
-                            if "BIND_NOW" in str(entry.tag) or (
-                                "FLAGS" in str(entry.tag) and "NOW" in str(entry)
-                            ):
-                                target.relro = "full"
-                                break
-                    except Exception:
-                        pass
-                else:
-                    target.relro = "none"
 
             elif lief.is_pe(path):
                 target.format = "PE"

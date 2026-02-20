@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import os
 import re
+import logging
 from dataclasses import dataclass, field
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -89,6 +92,7 @@ def _parse_frontmatter(content: str) -> tuple[dict[str, Any], str]:
     try:
         config = yaml.safe_load(frontmatter) or {}
     except Exception:
+        logger.warning("Failed to parse YAML frontmatter, using empty config")
         config = {}
 
     return config, body
@@ -112,5 +116,6 @@ def discover_agents(search_dirs: list[str]) -> list[Agent]:
                 if agent.config.name:
                     agents.append(agent)
             except Exception:
+                logger.warning("Failed to load agent from %s", full_path, exc_info=True)
                 continue
     return agents

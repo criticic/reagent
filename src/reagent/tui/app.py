@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
-from typing import Any
+from typing import TYPE_CHECKING, Callable
 
 from rich.markup import escape
 from rich.panel import Panel
@@ -14,6 +15,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.timer import Timer
 from textual.widgets import (
     Footer,
     Header,
@@ -25,6 +27,10 @@ from textual.widgets import (
 )
 
 from reagent.session.wire import EventType, Wire, WireEvent
+
+if TYPE_CHECKING:
+    from reagent.cli import AnalysisPipeline
+    from reagent.llm.streaming import StepResult
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +119,7 @@ class TUILogHandler(logging.Handler):
             # the main thread) — it posts to Textual's message queue.
             self._app.call_from_thread(self._app._update_status)
         except Exception:
-            pass  # Swallow errors — never let logging crash the TUI
+            pass  # Swallow errors — never let logging crash the TUI (intentional)
 
 
 class ReagentApp(App):
@@ -150,7 +156,7 @@ class ReagentApp(App):
         border: solid $secondary;
     }
 
-    #findings-pane, #hypotheses-pane, #observations-pane {
+    #findings-pane, #hypotheses-pane, #observations-pane, #terminal-pane {
         overflow-y: auto;
         padding: 0 1;
     }
@@ -238,6 +244,20 @@ class ReagentApp(App):
         margin: 0 0 0 1;
         color: $text-muted;
     }
+
+    .terminal-session-header {
+        color: $accent;
+        margin-top: 1;
+    }
+
+    .terminal-output {
+        color: $text-muted;
+    }
+
+    .terminal-exit-notice {
+        color: $warning;
+        margin: 0 0 1 0;
+    }
     """
 
     BINDINGS = [
@@ -250,16 +270,15 @@ class ReagentApp(App):
         binary_path: str,
         goal: str,
         wire: Wire,
-        pipeline: Any = None,
-        on_text_cb: Any = None,
-        on_step_cb: Any = None,
-        on_step_begin_cb: Any = None,
-        on_tool_call_cb: Any = None,
-        on_tool_result_cb: Any = None,
-        on_thinking_cb: Any = None,
-        **kwargs: Any,
+        pipeline: AnalysisPipeline | None = None,
+        on_text_cb: Callable[[str], None] | None = None,
+        on_step_cb: Callable[[int, StepResult], None] | None = None,
+        on_step_begin_cb: Callable[[int, str], None] | None = None,
+        on_tool_call_cb: Callable[[str, str, str], None] | None = None,
+        on_tool_result_cb: Callable[[str, str, str, bool], None] | None = None,
+        on_thinking_cb: Callable[[str], None] | None = None,
     ) -> None:
-        super().__init__(**kwargs)
+        super().__init__()
         self.binary_path = binary_path
         self.goal = goal
         self.wire = wire
@@ -279,12 +298,15 @@ class ReagentApp(App):
         self._thinking_buffer = ""
         self._streaming_thinking: Static | None = None  # Live-updating thinking widget
         self._log_handler: TUILogHandler | None = None
-        self._flush_timer: Any = None
-        self._spinner_timer: Any = None
+        self._flush_timer: Timer | None = None
+        self._spinner_timer: Timer | None = None
         self._spinner_idx = 0
         self._generating = False  # True while waiting for LLM
-        self._pending_tools: dict[str, Static] = {}  # tc_id -> pending Static widget
+        self._pending_tools: dict[
+            str, Static | tuple[Static, str, str]
+        ] = {}  # tc_id -> widget or (widget, name, args)
         self._widget_counter = 0
+        self._terminal_refresh_timer: Timer | None = None
 
     def _next_id(self, prefix: str = "w") -> str:
         self._widget_counter += 1
@@ -303,6 +325,8 @@ class ReagentApp(App):
                         yield VerticalScroll(id="hypotheses-pane")
                     with TabPane("Observations", id="observations-tab"):
                         yield VerticalScroll(id="observations-pane")
+                    with TabPane("Terminal", id="terminal-tab"):
+                        yield VerticalScroll(id="terminal-pane")
         yield Static(id="status-bar")
         yield Footer()
 
@@ -323,6 +347,10 @@ class ReagentApp(App):
 
         if self._pipeline is not None:
             self._run_agent()
+            # Refresh terminal panel every 2 seconds
+            self._terminal_refresh_timer = self.set_interval(
+                2.0, self._refresh_terminal
+            )
 
     def _install_log_handler(self) -> None:
         root = logging.getLogger()
@@ -391,13 +419,6 @@ class ReagentApp(App):
         chat.scroll_end(animate=False)
         return widget
 
-    def _append_markdown(self, text: str) -> None:
-        """Append a finalized Markdown block to chat."""
-        chat = self._chat_scroll()
-        md = Markdown(text, id=self._next_id(), classes="md-block")
-        chat.mount(md)
-        chat.scroll_end(animate=False)
-
     # --- Wire event loop ---
 
     @work(exclusive=True)
@@ -426,6 +447,7 @@ class ReagentApp(App):
         from reagent.llm.message import Message
 
         pipeline = self._pipeline
+        assert pipeline is not None, "_run_agent called without a pipeline"
         try:
             await pipeline.context.append(
                 Message.user(
@@ -463,7 +485,7 @@ class ReagentApp(App):
             await pipeline.pty_manager.cleanup()
             self.wire.close()
 
-    def _make_on_dmail(self) -> Any:
+    def _make_on_dmail(self) -> Callable[[int, str], None]:
         """Create an on_dmail callback that emits DMAIL events to the wire."""
         from reagent.tui.bridge import make_on_dmail
 
@@ -493,6 +515,7 @@ class ReagentApp(App):
             EventType.DMAIL: self._on_dmail,
             EventType.ERROR: self._on_error,
             EventType.STATUS: self._on_status,
+            EventType.PTY_EXIT: self._on_pty_exit,
             EventType.TURN_BEGIN: self._on_turn_begin,
             EventType.TURN_END: self._on_turn_end,
         }
@@ -672,8 +695,19 @@ class ReagentApp(App):
         name = data.get("name", "?")
         tc_id = data.get("id", "")
         agent = data.get("agent")
+        arguments = data.get("arguments", "")
         icon = _TOOL_ICONS.get(name, "⚙")
         pending_msg = _TOOL_PENDING.get(name, f"Running {name}...")
+
+        # For shell/debug_eval, show the actual command being run
+        if name in ("shell", "debug_eval") and arguments:
+            try:
+                args = json.loads(arguments)
+                cmd = args.get("command", "")
+                if cmd:
+                    pending_msg = cmd
+            except (json.JSONDecodeError, AttributeError):
+                pass
 
         # Prefix with agent name for subagent tool calls
         prefix = f"[dim]{agent}[/dim] " if agent else ""
@@ -685,7 +719,7 @@ class ReagentApp(App):
         )
 
         if tc_id:
-            self._pending_tools[tc_id] = widget
+            self._pending_tools[tc_id] = (widget, name, arguments)
 
     def _on_tool_result(self, data: dict) -> None:
         name = data.get("name", "?")
@@ -698,8 +732,72 @@ class ReagentApp(App):
         # Prefix with agent name for subagent tool results
         prefix = f"[dim]{agent}[/dim] " if agent else ""
 
+        # Extract the command for shell/debug_eval from pending tools
+        cmd_label = ""
+        pending_entry = self._pending_tools.pop(tc_id, None)
+        if pending_entry is not None:
+            if isinstance(pending_entry, tuple):
+                pending_widget, pending_name, pending_args = pending_entry
+            else:
+                # Backwards compat: plain widget
+                pending_widget = pending_entry
+                pending_name, pending_args = "", ""
+
+            if pending_name in ("shell", "debug_eval") and pending_args:
+                try:
+                    args = json.loads(pending_args)
+                    cmd_label = args.get("command", "")
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+        else:
+            pending_widget = None
+            # Fallback: try to extract command from content for shell results
+            # that arrive without a matching pending widget
+            if name in ("shell", "debug_eval") and not cmd_label:
+                logger.debug(
+                    "Tool result for %s (tc_id=%s) has no pending widget",
+                    name,
+                    tc_id,
+                )
+
         # Build the result line
-        if is_error:
+        if name in ("shell", "debug_eval") and cmd_label:
+            # Extract meaningful output lines, skipping the "[Exit code: N]" prefix
+            output_lines = []
+            if content:
+                for line in content.split("\n"):
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith("[Exit code:"):
+                        output_lines.append(stripped)
+
+            color = "red" if is_error else "dim"
+            header = f"{prefix}[{color}]{icon} {escape(cmd_label)}[/{color}]"
+
+            if output_lines:
+                # Show command on first line, output indented below
+                output_text = "\n".join(f"  {escape(l)}" for l in output_lines[:20])
+                result_text = f"{header}\n[{color}]{output_text}[/{color}]"
+            else:
+                result_text = header
+            css_class = "tool-line tool-error" if is_error else "tool-line tool-done"
+        elif name in ("shell", "debug_eval") and not cmd_label:
+            # Shell/debug result without a pending widget — show output directly
+            output_lines = []
+            if content:
+                for line in content.split("\n"):
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith("[Exit code:"):
+                        output_lines.append(stripped)
+
+            color = "red" if is_error else "dim"
+            header = f"{prefix}[{color}]{icon} {escape(name)}[/{color}]"
+            if output_lines:
+                output_text = "\n".join(f"  {escape(l)}" for l in output_lines[:20])
+                result_text = f"{header}\n[{color}]{output_text}[/{color}]"
+            else:
+                result_text = header
+            css_class = "tool-line tool-error" if is_error else "tool-line tool-done"
+        elif is_error:
             first_line = content.split("\n")[0][:120] if content else "Error"
             result_text = (
                 f"{prefix}[red]{icon} {escape(name)}: {escape(first_line)}[/red]"
@@ -713,7 +811,6 @@ class ReagentApp(App):
             css_class = "tool-line tool-done"
 
         # Replace the pending widget if we have one, otherwise append
-        pending_widget = self._pending_tools.pop(tc_id, None)
         if pending_widget is not None:
             pending_widget.update(result_text)
             pending_widget.set_classes(css_class)
@@ -779,6 +876,101 @@ class ReagentApp(App):
         pane.scroll_end()
 
     # --- Misc events ---
+
+    def _on_pty_exit(self, data: dict) -> None:
+        """Handle PTY_EXIT — a process died unexpectedly."""
+        session_id = data.get("session_id", "?")
+        title = data.get("title", "")
+        exit_code = data.get("exit_code")
+        last_output = data.get("last_output", "")
+
+        label = title or session_id
+        code_str = str(exit_code) if exit_code is not None else "?"
+
+        # Show in chat
+        self._append_static(
+            f"[bold yellow]PTY exited: {escape(label)} (code={code_str})[/bold yellow]",
+            classes="chat-status",
+        )
+
+        # Show in terminal pane
+        try:
+            pane = self.query_one("#terminal-pane", VerticalScroll)
+            pane.mount(
+                Label(
+                    f"[{label}] exited (code={code_str})\n{last_output}",
+                    classes="terminal-exit-notice",
+                )
+            )
+            pane.scroll_end()
+        except Exception:
+            pass
+
+    def _refresh_terminal(self) -> None:
+        """Periodically refresh the Terminal tab with live PTY output."""
+        if self._pipeline is None:
+            return
+
+        try:
+            pane = self.query_one("#terminal-pane", VerticalScroll)
+        except Exception:
+            return
+
+        sessions = self._pipeline.pty_manager.list_sessions()
+        if not sessions:
+            return
+
+        # Clear and rebuild — simple approach for a sidebar panel
+        pane.remove_children()
+
+        for info in sessions:
+            sid = info["id"]
+            title = info.get("title", "")
+            status = info.get("status", "?")
+            label = title or sid
+
+            session = self._pipeline.pty_manager.get(sid)
+            if session is None:
+                continue
+
+            # Header with status colour
+            status_color = "green" if status == "running" else "red"
+            pane.mount(
+                Static(
+                    f"[bold]{escape(label)}[/bold]  [{status_color}]{status}[/{status_color}]",
+                    classes="terminal-session-header",
+                )
+            )
+
+            # Last N lines of output.
+            # For shell sessions, filter out internal sentinel prompts so the
+            # terminal tab shows clean command/output pairs.
+            tail_lines = session.buffer.read_tail(30)
+            if tail_lines:
+                if title == "shell":
+                    # Filter shell sentinel lines and heredoc noise
+                    filtered: list[str] = []
+                    for line in tail_lines:
+                        stripped = line.strip()
+                        if stripped == "___REAGENT_PROMPT___":
+                            continue
+                        if stripped == "_REAGENT_EOF_":
+                            continue
+                        # Bash continuation prompts for heredocs
+                        if stripped in (">", "> "):
+                            continue
+                        filtered.append(line)
+                    tail_lines = filtered[-20:]  # Keep last 20 after filtering
+
+                output_text = "\n".join(escape(line) for line in tail_lines)
+                pane.mount(
+                    Static(
+                        f"[dim]{output_text}[/dim]",
+                        classes="terminal-output",
+                    )
+                )
+
+        pane.scroll_end()
 
     def _on_compaction(self, data: dict) -> None:
         action = data.get("action", "compacted")

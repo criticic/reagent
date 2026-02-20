@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import enum
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator
+from typing import Any
 
 
 class EventType(enum.Enum):
@@ -31,6 +31,7 @@ class EventType(enum.Enum):
     DMAIL = "dmail"
     ERROR = "error"
     STATUS = "status"
+    PTY_EXIT = "pty_exit"
 
 
 @dataclass
@@ -49,9 +50,15 @@ class Wire:
 
     def __init__(self) -> None:
         self._subscribers: list[asyncio.Queue[WireEvent | None]] = []
+        self._closed: bool = False
 
     def send(self, event: WireEvent) -> None:
-        """Send an event to all subscribers."""
+        """Send an event to all subscribers.
+
+        Silently drops events after ``close()`` has been called.
+        """
+        if self._closed:
+            return
         for q in self._subscribers:
             q.put_nowait(event)
 
@@ -117,6 +124,26 @@ class Wire:
             )
         )
 
+    def send_pty_exit(
+        self,
+        session_id: str,
+        title: str,
+        exit_code: int | None,
+        last_output: str = "",
+    ) -> None:
+        """Notify subscribers that a PTY session exited unexpectedly."""
+        self.send(
+            WireEvent(
+                type=EventType.PTY_EXIT,
+                data={
+                    "session_id": session_id,
+                    "title": title,
+                    "exit_code": exit_code,
+                    "last_output": last_output[:500],
+                },
+            )
+        )
+
     def subscribe(self) -> asyncio.Queue[WireEvent | None]:
         """Subscribe to events. Returns a queue to read from."""
         q: asyncio.Queue[WireEvent | None] = asyncio.Queue()
@@ -130,5 +157,6 @@ class Wire:
 
     def close(self) -> None:
         """Signal all subscribers that the wire is closing."""
+        self._closed = True
         for q in self._subscribers:
             q.put_nowait(None)

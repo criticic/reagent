@@ -25,6 +25,16 @@ Use `update_model` to record what you discover directly into the shared knowledg
 
 Record observations as you go, don't wait until the end.
 
+## Step Budget
+
+You have a maximum of **15 steps**. Triage should be fast — spend roughly:
+- **Steps 1–3**: `file_info`, `strings`, `sections`
+- **Steps 4–8**: `functions`, any `shell` recon
+- **Steps 9–12**: Record observations and hypotheses with `update_model`
+- **Steps 13–15**: Summarize findings and finish
+
+If you're past step 10, wrap up and report what you have rather than starting new analysis.
+
 ## Your Output
 
 Summarize your findings clearly:

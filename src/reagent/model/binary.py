@@ -70,7 +70,7 @@ class BinaryModel:
         finding = Finding(
             description=hyp.description,
             category=hyp.category,
-            addresses=[hyp.address] if hyp.address else [],
+            addresses=[hyp.address] if hyp.address is not None else [],
             evidence=hyp.evidence,
             verified=True,
             verified_by=agent,
@@ -125,7 +125,7 @@ class BinaryModel:
             recent_obs = self.observations[-20:]  # Last 20
             if recent_obs:
                 obs_lines = [
-                    f"  [{o.id}] {o.type} @ {hex(o.address) if o.address else 'N/A'}: {o.data[:200]}"
+                    f"  [{o.id}] {o.type} @ {hex(o.address) if o.address is not None else 'N/A'}: {o.data[:200]}"
                     for o in recent_obs
                 ]
                 sections.append(
@@ -176,3 +176,24 @@ class BinaryModel:
     def to_json(self) -> str:
         """Serialize to JSON string."""
         return json.dumps(self.to_dict(), indent=2, default=str)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> BinaryModel:
+        """Deserialize from a dict (inverse of to_dict)."""
+        target = TargetInfo(**data.get("target", {}))
+        observations = [Observation(**o) for o in data.get("observations", [])]
+        hypotheses = [Hypothesis(**h) for h in data.get("hypotheses", [])]
+        findings = [Finding(**f) for f in data.get("findings", [])]
+        return cls(
+            target=target,
+            observations=observations,
+            hypotheses=hypotheses,
+            findings=findings,
+            functions=data.get("functions", {}),
+            strings=data.get("strings", []),
+        )
+
+    @classmethod
+    def from_json(cls, json_str: str) -> BinaryModel:
+        """Deserialize from a JSON string."""
+        return cls.from_dict(json.loads(json_str))

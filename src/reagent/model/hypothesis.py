@@ -46,6 +46,8 @@ class Hypothesis:
     verified_by: str | None = None
     address: int | None = None  # primary address this hypothesis relates to
 
+    reject_reason: str = ""  # reason for rejection (if rejected)
+
     def confirm(self, agent: str, additional_evidence: list[str] | None = None) -> None:
         """Mark this hypothesis as confirmed."""
         self.status = "confirmed"
@@ -59,6 +61,7 @@ class Hypothesis:
         self.status = "rejected"
         self.verified_by = agent
         self.confidence = 0.0
+        self.reject_reason = reason
 
 
 @dataclass

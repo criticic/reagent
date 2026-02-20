@@ -9,14 +9,13 @@ The orchestrator is the top-level controller that:
 
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
 import os
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, ClassVar
+from typing import ClassVar, Callable
+from collections.abc import Awaitable
 
 from pydantic import BaseModel, Field
 
@@ -89,6 +88,8 @@ class DispatchSubagentTool(BaseTool[DispatchSubagentParams]):
         binary_path: str,
         wire: Wire | None = None,
         on_subagent_text: Callable[[str, str], None] | None = None,
+        compact_fn: Callable[..., Awaitable[str]] | None = None,
+        compact_provider: ChatProvider | None = None,
     ) -> None:
         self._agent_registry = agent_registry
         self._tool_registry = tool_registry
@@ -97,6 +98,8 @@ class DispatchSubagentTool(BaseTool[DispatchSubagentParams]):
         self._binary_path = binary_path
         self._wire = wire
         self._on_subagent_text = on_subagent_text
+        self._compact_fn = compact_fn
+        self._compact_provider = compact_provider
 
     async def execute(self, params: DispatchSubagentParams) -> ToolResult:
         agent = self._agent_registry.get(params.agent)
@@ -127,6 +130,8 @@ class DispatchSubagentTool(BaseTool[DispatchSubagentParams]):
                 wire=self._wire,
                 on_subagent_text=self._on_subagent_text,
                 agent_name=params.agent,
+                compact_fn=self._compact_fn,
+                compact_provider=self._compact_provider,
             )
 
             return ToolOk(
@@ -322,6 +327,8 @@ async def _run_subagent(
     wire: Wire | None = None,
     on_subagent_text: Callable[[str, str], None] | None = None,
     agent_name: str = "",
+    compact_fn: Callable[..., Awaitable[str]] | None = None,
+    compact_provider: ChatProvider | None = None,
 ) -> str:
     """Run a subagent with its own context.
 
@@ -393,6 +400,8 @@ async def _run_subagent(
             on_tool_result=cbs.on_tool_result,
             on_thinking=cbs.on_thinking,
             on_dmail=cbs.on_dmail,
+            compact_fn=compact_fn,
+            compact_provider=compact_provider,
         )
 
         cbs.on_end()
@@ -409,6 +418,8 @@ async def _run_subagent(
             provider=provider,
             tool_registry=subagent_tools,
             on_text=_on_text_cb_legacy,
+            compact_fn=compact_fn,
+            compact_provider=compact_provider,
         )
 
     # Extract the final assistant message(s)
@@ -436,8 +447,8 @@ async def _run_subagent(
     try:
         os.unlink(context_path)
         os.rmdir(tmp_dir)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Failed to clean up temp context %s: %s", tmp_dir, e)
 
     return result
 
@@ -467,6 +478,8 @@ def setup_orchestrator(
     agents_dir: str | None = None,
     on_subagent_text: Callable[[str, str], None] | None = None,
     wire: Wire | None = None,
+    compact_fn: Callable[..., Awaitable[str]] | None = None,
+    compact_provider: ChatProvider | None = None,
 ) -> OrchestratorSetup:
     """Set up the orchestrator with all its components.
 
@@ -500,6 +513,8 @@ def setup_orchestrator(
         binary_path=binary_path,
         wire=wire,
         on_subagent_text=on_subagent_text,
+        compact_fn=compact_fn,
+        compact_provider=compact_provider,
     )
     model_tool = UpdateModelTool(binary_model, wire=wire)
 

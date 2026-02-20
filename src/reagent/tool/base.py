@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import Any, ClassVar, Generic, TypeVar, get_type_hints
+from dataclasses import dataclass
+from typing import Any, ClassVar, Generic, TypeVar
 
 from pydantic import BaseModel
 
@@ -38,15 +37,6 @@ class ToolError(ToolResult):
     """Failed tool result."""
 
     is_error: bool = True
-
-
-@dataclass
-class ToolRejected(ToolResult):
-    """User rejected the tool call."""
-
-    output: str = "Tool call was rejected by the user."
-    is_error: bool = True
-    rejected: bool = True
 
 
 class BaseTool(ABC, Generic[T]):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -14,7 +15,6 @@ from reagent.llm.message import (
     ThinkingPart,
     ToolCall,
     ToolCallPart,
-    ToolResultPart,
     TokenUsage,
 )
 from reagent.llm.provider import ChatProvider
@@ -66,6 +66,8 @@ class StepResult:
         """Why did this step end?"""
         if self.message.tool_calls:
             return "tool_calls"
+        if self.finish_reason == "length":
+            return "context_overflow"
         return "end_turn"
 
 
@@ -203,7 +205,7 @@ async def step(
     system: str,
     messages: list[Message],
     tools: list[ToolSpec] | None = None,
-    tool_dispatch: Callable[[ToolCall], Any] | None = None,
+    tool_dispatch: Callable[[ToolCall], Awaitable[tuple[str, bool]]] | None = None,
     on_part: OnPart = None,
     on_tool_call: OnToolCall = None,
     on_tool_result: OnToolResult = None,

@@ -18,12 +18,15 @@ the wire event so the UI can attribute it to the right subagent.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Callable
 
 from reagent.session.wire import EventType, Wire, WireEvent
 
+if TYPE_CHECKING:
+    from reagent.llm.streaming import StepResult
 
-def make_on_text(wire: Wire) -> Any:
+
+def make_on_text(wire: Wire) -> Callable[[str], None]:
     """Create an on_text callback that emits TEXT events."""
 
     def on_text(text: str) -> None:
@@ -32,7 +35,7 @@ def make_on_text(wire: Wire) -> Any:
     return on_text
 
 
-def make_on_thinking(wire: Wire) -> Any:
+def make_on_thinking(wire: Wire) -> Callable[[str], None]:
     """Create an on_thinking callback that emits THINKING events."""
 
     def on_thinking(text: str) -> None:
@@ -41,7 +44,7 @@ def make_on_thinking(wire: Wire) -> Any:
     return on_thinking
 
 
-def make_on_step_begin(wire: Wire) -> Any:
+def make_on_step_begin(wire: Wire) -> Callable[[int, str], None]:
     """Create an on_step_begin callback that emits STEP_BEGIN before the LLM call."""
 
     def on_step_begin(step_no: int, agent_name: str) -> None:
@@ -55,21 +58,21 @@ def make_on_step_begin(wire: Wire) -> Any:
     return on_step_begin
 
 
-def make_on_tool_call(wire: Wire) -> Any:
+def make_on_tool_call(wire: Wire) -> Callable[[str, str, str], None]:
     """Create an on_tool_call callback that emits TOOL_CALL in real-time."""
 
     def on_tool_call(tc_id: str, name: str, arguments: str) -> None:
         wire.send(
             WireEvent(
                 type=EventType.TOOL_CALL,
-                data={"name": name, "id": tc_id},
+                data={"name": name, "id": tc_id, "arguments": arguments},
             )
         )
 
     return on_tool_call
 
 
-def make_on_tool_result(wire: Wire) -> Any:
+def make_on_tool_result(wire: Wire) -> Callable[[str, str, str, bool], None]:
     """Create an on_tool_result callback that emits TOOL_RESULT in real-time."""
 
     def on_tool_result(tc_id: str, name: str, content: str, is_error: bool) -> None:
@@ -79,7 +82,7 @@ def make_on_tool_result(wire: Wire) -> Any:
                 data={
                     "name": name,
                     "id": tc_id,
-                    "content": content[:500],
+                    "content": content[:2000],
                     "is_error": is_error,
                 },
             )
@@ -88,7 +91,7 @@ def make_on_tool_result(wire: Wire) -> Any:
     return on_tool_result
 
 
-def make_on_dmail(wire: Wire) -> Any:
+def make_on_dmail(wire: Wire) -> Callable[[int, str], None]:
     """Create an on_dmail callback that emits DMAIL events."""
 
     def on_dmail(checkpoint_id: int, message: str) -> None:
@@ -102,7 +105,7 @@ def make_on_dmail(wire: Wire) -> Any:
     return on_dmail
 
 
-def make_on_step(wire: Wire) -> Any:
+def make_on_step(wire: Wire) -> Callable[[int, StepResult], None]:
     """Create an on_step callback that emits usage/status after the step completes.
 
     STEP_BEGIN, TOOL_CALL, and TOOL_RESULT are now emitted in real-time via
@@ -110,9 +113,9 @@ def make_on_step(wire: Wire) -> Any:
     bookkeeping (token usage).
     """
 
-    def on_step(step_no: int, result: Any) -> None:
+    def on_step(step_no: int, result: StepResult) -> None:
         # Emit token usage
-        if hasattr(result, "usage") and result.usage:
+        if result.usage and result.usage.total_tokens:
             wire.send(
                 WireEvent(
                     type=EventType.STATUS,
@@ -123,7 +126,7 @@ def make_on_step(wire: Wire) -> Any:
     return on_step
 
 
-def make_on_subagent_text(wire: Wire) -> Any:
+def make_on_subagent_text(wire: Wire) -> Callable[[str, str], None]:
     """Create an on_subagent_text callback that emits TEXT events with agent info."""
 
     def on_subagent_text(agent_name: str, text: str) -> None:
@@ -156,7 +159,7 @@ class SubagentCallbacks:
     on_step_begin: Callable[[int, str], None]
     on_tool_call: Callable[[str, str, str], None]
     on_tool_result: Callable[[str, str, str, bool], None]
-    on_step: Callable[[int, Any], None]
+    on_step: Callable[[int, StepResult], None]
     on_dmail: Callable[[int, str], None]
     on_begin: Callable[[], None]
     on_end: Callable[[], None]
@@ -197,7 +200,12 @@ def make_subagent_callbacks(wire: Wire, agent_name: str) -> SubagentCallbacks:
         wire.send(
             WireEvent(
                 type=EventType.TOOL_CALL,
-                data={"name": name, "id": tc_id, "agent": agent_name},
+                data={
+                    "name": name,
+                    "id": tc_id,
+                    "agent": agent_name,
+                    "arguments": arguments,
+                },
             )
         )
 
@@ -208,15 +216,15 @@ def make_subagent_callbacks(wire: Wire, agent_name: str) -> SubagentCallbacks:
                 data={
                     "name": name,
                     "id": tc_id,
-                    "content": content[:500],
+                    "content": content[:2000],
                     "is_error": is_error,
                     "agent": agent_name,
                 },
             )
         )
 
-    def on_step(step_no: int, result: Any) -> None:
-        if hasattr(result, "usage") and result.usage:
+    def on_step(step_no: int, result: StepResult) -> None:
+        if result.usage and result.usage.total_tokens:
             wire.send(
                 WireEvent(
                     type=EventType.STATUS,

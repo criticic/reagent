@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
-from typing import Any, Callable
+from collections.abc import Awaitable
+from typing import Callable
 
 from reagent.agent.agent import Agent
 from reagent.context import Context
-from reagent.llm.message import Message
+from reagent.llm.message import ContentPart, Message
 from reagent.llm.provider import ChatProvider
 from reagent.llm.streaming import step, StepResult
 from reagent.tool.registry import ToolRegistry
@@ -24,12 +25,16 @@ class TurnOutcome(enum.Enum):
 
     COMPLETE = "complete"  # Agent finished naturally (no more tool calls)
     MAX_STEPS = "max_steps"  # Hit the step limit
-    REJECTED = "rejected"  # A tool call was rejected
     ERROR = "error"  # Unrecoverable error
 
 
-class BackToTheFuture(Exception):
-    """Raised when D-Mail triggers a context revert."""
+class BackToTheFuture(BaseException):
+    """Raised when D-Mail triggers a context revert.
+
+    Extends BaseException (not Exception) so it propagates through
+    generic ``except Exception`` handlers in BaseTool.__call__ and
+    streaming._run_tool without being swallowed.
+    """
 
     def __init__(self, checkpoint_id: int, message: str) -> None:
         self.checkpoint_id = checkpoint_id
@@ -49,7 +54,7 @@ async def agent_loop(
     on_tool_result: Callable[[str, str, str, bool], None] | None = None,
     on_thinking: Callable[[str], None] | None = None,
     on_dmail: Callable[[int, str], None] | None = None,
-    compact_fn: Callable[..., Any] | None = None,
+    compact_fn: Callable[..., Awaitable[str]] | None = None,
     compact_provider: ChatProvider | None = None,
 ) -> TurnOutcome:
     """Run the core agent loop.
@@ -108,7 +113,7 @@ async def agent_loop(
         # 3. Build messages and call LLM
         messages = context.get_messages()
 
-        def _on_text_part(part: Any) -> None:
+        def _on_text_part(part: ContentPart) -> None:
             from reagent.llm.message import TextPart as TP
 
             if isinstance(part, TP) and on_text:
@@ -153,6 +158,15 @@ async def agent_loop(
                 "Continue with the task, applying what you now know."
             )
             continue
+        except Exception as e:
+            logger.error(
+                "Agent %s: unrecoverable error at step %d: %s",
+                agent.name,
+                step_no,
+                e,
+                exc_info=True,
+            )
+            return TurnOutcome.ERROR
 
         # 4. Update context (shielded from cancellation)
         await asyncio.shield(context.grow(result.message, result.tool_results))
@@ -170,15 +184,6 @@ async def agent_loop(
             # No tool calls — agent is done
             logger.info("Agent %s completed after %d steps", agent.name, step_no)
             return TurnOutcome.COMPLETE
-
-        # Tool calls were made; check for rejections
-        for tr in result.tool_results:
-            for p in tr.parts:
-                from reagent.llm.message import ToolResultPart
-
-                if isinstance(p, ToolResultPart) and hasattr(p, "rejected"):
-                    logger.info("Tool call rejected, stopping agent")
-                    return TurnOutcome.REJECTED
 
         # Continue loop (tool calls were handled, feed results back)
 

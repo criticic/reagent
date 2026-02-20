@@ -43,3 +43,13 @@ For each hypothesis verified:
 - If the program crashes, note the crash location and register state.
 - If verifying a vulnerability, document the exact conditions for triggering it.
 - Always `debug_kill` your session when done to free resources.
+
+## Step Budget
+
+You have a maximum of **30 steps**. Debugging is step-intensive — budget carefully:
+- **Steps 1–3**: Plan strategy with `think`, launch session, set breakpoints.
+- **Steps 4–20**: Execute, inspect registers/memory, step through code.
+- **Steps 21–27**: Record findings with `update_model`, verify remaining hypotheses.
+- **Steps 28–30**: `debug_kill` session, summarize, finish.
+
+**Always reserve at least 2 steps for cleanup** (`debug_kill` + final summary). If you're past step 23 and still debugging, wrap up immediately — kill the session and report what you observed.

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Literal
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -107,6 +110,11 @@ class Message:
                 try:
                     args = json.loads(p.arguments) if p.arguments else {}
                 except json.JSONDecodeError:
+                    logger.warning(
+                        "Failed to parse tool call arguments for %s: %s",
+                        p.name,
+                        p.arguments[:200],
+                    )
                     args = {}
                 calls.append(ToolCall(id=p.id, name=p.name, arguments=args))
         return calls

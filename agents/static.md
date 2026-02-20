@@ -26,6 +26,16 @@ Use `update_model` to record your analysis directly into the shared knowledge ba
 
 Record observations and hypotheses as you discover them — don't wait until the end.
 
+## Step Budget
+
+You have a maximum of **30 steps**. Plan your depth accordingly:
+- **Steps 1–5**: Decompile the primary target function(s), orient yourself.
+- **Steps 6–20**: Trace control flow, xrefs, analyze data transformations.
+- **Steps 21–27**: Record hypotheses and observations with `update_model`.
+- **Steps 28–30**: Summarize findings and finish.
+
+If you're past step 22 and still exploring, wrap up: record what you've found, state what remains unclear, and finish. Partial results are better than hitting the step limit mid-analysis.
+
 ## Your Output
 
 For each function/region analyzed:

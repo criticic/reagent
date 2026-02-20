@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import enum
 import logging
 import os
 import pty
@@ -11,12 +12,21 @@ import signal
 import subprocess
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from reagent.pty.buffer import RollingBuffer
 from reagent.tool.truncation import strip_ansi, sanitize_binary_output
 
 logger = logging.getLogger(__name__)
+
+
+class PTYStatus(enum.Enum):
+    """Lifecycle states for a PTY session."""
+
+    RUNNING = "running"
+    KILLING = "killing"  # Kill requested, waiting for process to die
+    KILLED = "killed"  # Killed by us (SIGKILL)
+    EXITED = "exited"  # Process exited on its own
 
 
 @dataclass
@@ -29,6 +39,7 @@ class PTYSession:
     - ANSI stripping and binary sanitization
     - Prompt-based command/response interaction
     - Timeout support
+    - Exit notification callback
 
     Uses subprocess.Popen (not os.fork) to avoid deadlocks when
     spawned from within an asyncio event loop on macOS.
@@ -47,7 +58,19 @@ class PTYSession:
     _pid: int = field(default=0, init=False)
     _pgid: int = field(default=0, init=False)
     _reader_task: asyncio.Task | None = field(default=None, init=False)
-    _alive: bool = field(default=False, init=False)
+    _status: PTYStatus = field(default=PTYStatus.RUNNING, init=False)
+    _on_exit: Callable[[PTYSession, int | None], None] | None = field(
+        default=None, init=False
+    )
+
+    def set_on_exit(self, callback: Callable[[PTYSession, int | None], None]) -> None:
+        """Set a callback to be invoked when the process exits unexpectedly.
+
+        The callback receives (session, exit_code). It is called from the
+        reader task when the process dies on its own — NOT when killed via
+        kill().
+        """
+        self._on_exit = callback
 
     async def start(self) -> None:
         """Spawn the process in a new PTY with its own process group."""
@@ -78,7 +101,10 @@ class PTYSession:
 
         self._pid = self._proc.pid
         self._pgid = os.getpgid(self._pid)
-        self._alive = True
+        self._status = PTYStatus.RUNNING
+
+        # Attach the asyncio event loop to the buffer for event-based notification
+        self.buffer.attach_loop(asyncio.get_running_loop())
 
         # Start async reader
         self._reader_task = asyncio.create_task(self._read_loop())
@@ -93,9 +119,9 @@ class PTYSession:
 
     async def _read_loop(self) -> None:
         """Continuously read output from the PTY master fd."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
-            while self._alive:
+            while self._status == PTYStatus.RUNNING:
                 try:
                     data = await loop.run_in_executor(
                         None, lambda: os.read(self._master_fd, 4096)
@@ -106,14 +132,25 @@ class PTYSession:
                 if not data:
                     break
 
-                text = data.decode("utf-8", errors="replace")
-                text = strip_ansi(text)
-                text = sanitize_binary_output(text)
-                self.buffer.append_text(text)
+                raw_text = data.decode("utf-8", errors="replace")
+                cleaned = strip_ansi(raw_text)
+                cleaned = sanitize_binary_output(cleaned)
+                self.buffer.append_text(cleaned, raw_text=raw_text)
         except Exception as e:
             logger.debug("PTY reader %s ended: %s", self.id, e)
         finally:
-            self._alive = False
+            # Only transition to EXITED if we weren't already killing
+            if self._status == PTYStatus.RUNNING:
+                exit_code = self._proc.poll() if self._proc else None
+                self._status = PTYStatus.EXITED
+                logger.info("PTY session %s exited (code=%s)", self.id, exit_code)
+                if self._on_exit:
+                    try:
+                        self._on_exit(self, exit_code)
+                    except Exception:
+                        logger.exception(
+                            "Error in on_exit callback for session %s", self.id
+                        )
 
     async def send(self, data: str, timeout: float = 30.0) -> str:
         """Send input to the PTY and capture output.
@@ -128,7 +165,7 @@ class PTYSession:
         Returns:
             New output produced after the command.
         """
-        if not self._alive:
+        if self._status != PTYStatus.RUNNING:
             raise RuntimeError(f"PTY session {self.id} is not running")
 
         # Record current buffer position
@@ -156,7 +193,7 @@ class PTYSession:
         Returns:
             All output from command send until pattern match (inclusive).
         """
-        if not self._alive:
+        if self._status != PTYStatus.RUNNING:
             raise RuntimeError(f"PTY session {self.id} is not running")
 
         before = self.buffer.line_count
@@ -166,16 +203,20 @@ class PTYSession:
         os.write(self._master_fd, data.encode())
 
         compiled = re.compile(pattern)
-        deadline = asyncio.get_event_loop().time() + timeout
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
 
-        while asyncio.get_event_loop().time() < deadline:
+        while loop.time() < deadline:
             current = self.buffer.line_count
             if current > before:
                 new_lines = self.buffer.read(offset=before, limit=current - before)
                 for i, line in enumerate(new_lines):
                     if compiled.search(line):
                         return "\n".join(new_lines[: i + 1])
-            await asyncio.sleep(0.05)
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            await self.buffer.wait_for_data(timeout=min(remaining, 0.5))
 
         # Timeout — return whatever we have
         current = self.buffer.line_count
@@ -187,26 +228,31 @@ class PTYSession:
     ) -> list[str]:
         """Wait for output to settle after a command.
 
+        Uses event-based notification instead of fixed-interval polling.
         Returns new lines produced after start_line.
         """
-        deadline = asyncio.get_event_loop().time() + timeout
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
         last_count = start_line
         settled_at = None
 
-        while asyncio.get_event_loop().time() < deadline:
+        while loop.time() < deadline:
             current = self.buffer.line_count
             if current > last_count:
                 last_count = current
-                settled_at = asyncio.get_event_loop().time()
-            elif (
-                settled_at
-                and (asyncio.get_event_loop().time() - settled_at) > settle_time
-            ):
+                settled_at = loop.time()
+            elif settled_at and (loop.time() - settled_at) > settle_time:
                 # Output has settled
                 break
             elif current > start_line and settled_at is None:
-                settled_at = asyncio.get_event_loop().time()
-            await asyncio.sleep(0.05)
+                settled_at = loop.time()
+
+            # Wait for new data or settle timeout, whichever comes first
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            wait_time = settle_time if settled_at else min(remaining, 0.5)
+            await self.buffer.wait_for_data(timeout=wait_time)
 
         # Return new lines
         count = self.buffer.line_count - start_line
@@ -216,10 +262,10 @@ class PTYSession:
 
     def kill(self) -> None:
         """Kill the entire process tree."""
-        if not self._alive:
+        if self._status not in (PTYStatus.RUNNING, PTYStatus.KILLING):
             return
 
-        self._alive = False
+        self._status = PTYStatus.KILLING
         try:
             os.killpg(self._pgid, signal.SIGKILL)
             logger.info("Killed PTY session %s (pgid=%d)", self.id, self._pgid)
@@ -240,28 +286,37 @@ class PTYSession:
         except OSError:
             pass
 
+        self._status = PTYStatus.KILLED
+
     @property
     def alive(self) -> bool:
-        return self._alive
+        return self._status == PTYStatus.RUNNING
+
+    @property
+    def status(self) -> PTYStatus:
+        return self._status
 
     async def wait_for_exit(self, timeout: float = 10.0) -> int | None:
         """Wait for the process to exit. Returns exit code or None on timeout."""
         if self._proc is None:
             return -1
         try:
-            deadline = asyncio.get_event_loop().time() + timeout
-            while asyncio.get_event_loop().time() < deadline:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout
+            while loop.time() < deadline:
                 ret = self._proc.poll()
                 if ret is not None:
-                    self._alive = False
+                    if self._status == PTYStatus.RUNNING:
+                        self._status = PTYStatus.EXITED
                     return ret
                 await asyncio.sleep(0.1)
         except Exception:
-            self._alive = False
+            if self._status == PTYStatus.RUNNING:
+                self._status = PTYStatus.EXITED
             return -1
         return None
 
     def __del__(self) -> None:
         """Ensure cleanup on garbage collection."""
-        if self._alive:
+        if self._status in (PTYStatus.RUNNING, PTYStatus.KILLING):
             self.kill()

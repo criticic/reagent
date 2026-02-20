@@ -4,18 +4,28 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Callable
 
 import typer
 
 from reagent.config import ReagentConfig
 from reagent.context.management import auto_manage_context
+
+if TYPE_CHECKING:
+    from reagent.agent.orchestrator import OrchestratorSetup
+    from reagent.context import Context
+    from reagent.llm.provider import ChatProvider
+    from reagent.model import BinaryModel
+    from reagent.pty.manager import PTYManager
+    from reagent.session.wire import Wire
+    from reagent.tool.registry import ToolRegistry
 
 app = typer.Typer(
     name="reagent",
@@ -65,13 +75,13 @@ def _cleanup_mask(tmp_dir: Path | None) -> None:
 class AnalysisPipeline:
     """All components needed to run an analysis — shared between CLI and TUI."""
 
-    provider: Any
-    compact_provider: Any  # Fast/cheap provider for context compaction
-    pty_manager: Any
-    tool_registry: Any
-    binary_model: Any
-    orch_setup: Any
-    context: Any
+    provider: ChatProvider
+    compact_provider: ChatProvider  # Fast/cheap provider for context compaction
+    pty_manager: PTYManager
+    tool_registry: ToolRegistry
+    binary_model: BinaryModel
+    orch_setup: OrchestratorSetup
+    context: Context
     context_path: Path
 
 
@@ -79,8 +89,8 @@ def _build_pipeline(
     binary_path: str,
     goal: str,
     config: ReagentConfig,
-    on_subagent_text: Any = None,
-    wire: Any = None,
+    on_subagent_text: Callable[[str, str], None] | None = None,
+    wire: Wire | None = None,
 ) -> AnalysisPipeline:
     """Set up all components for an analysis run.
 
@@ -120,7 +130,7 @@ def _build_pipeline(
     )
 
     # PTY manager
-    pty_manager = PTYManager()
+    pty_manager = PTYManager(wire=wire)
 
     # Tool registry
     cwd = os.path.dirname(binary_path)
@@ -134,8 +144,8 @@ def _build_pipeline(
         else None
     )
 
-    builtin_tools: list[Any] = [
-        ShellTool(cwd=cwd),
+    builtin_tools = [
+        ShellTool(cwd=cwd, pty_manager=pty_manager),
         ReadFileTool(cwd=cwd),
         WriteFileTool(cwd=cwd),
         ThinkTool(),
@@ -176,6 +186,8 @@ def _build_pipeline(
         agents_dir=agents_dir,
         on_subagent_text=on_subagent_text,
         wire=wire,
+        compact_fn=auto_manage_context,
+        compact_provider=compact_provider,
     )
 
     # Context / session
@@ -345,8 +357,17 @@ async def _run_analysis(binary_path: str, goal: str, config: ReagentConfig) -> N
 
             elif event.type == EventType.TOOL_CALL:
                 name = d.get("name", "?")
+                arguments = d.get("arguments", "")
                 prefix = f"  [{agent}] " if agent else "  "
-                print(f"{prefix}> {name}", flush=True)
+                # Show the actual command for shell/debug_eval
+                detail = ""
+                if name in ("shell", "debug_eval") and arguments:
+                    try:
+                        args = json.loads(arguments)
+                        detail = f" {args.get('command', '')}"
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
+                print(f"{prefix}> {name}{detail}", flush=True)
 
             elif event.type == EventType.TOOL_RESULT:
                 name = d.get("name", "?")
@@ -402,6 +423,14 @@ async def _run_analysis(binary_path: str, goal: str, config: ReagentConfig) -> N
             elif event.type == EventType.ERROR:
                 error = d.get("error", "Unknown error")
                 print(f"\nERROR: {error}", flush=True)
+
+            elif event.type == EventType.PTY_EXIT:
+                session_id = d.get("session_id", "?")
+                title = d.get("title", "")
+                exit_code = d.get("exit_code")
+                label = title or session_id
+                code_str = str(exit_code) if exit_code is not None else "?"
+                print(f"\n  [pty-exit] {label} (code={code_str})", flush=True)
 
         wire.unsubscribe(queue)
 
@@ -565,11 +594,11 @@ def tui(
 
 
 def _register_re_tools(
-    registry: Any,
+    registry: ToolRegistry,
     binary_path: str,
-    pty_manager: Any,
-    binary_model: Any = None,
-    wire: Any = None,
+    pty_manager: PTYManager,
+    binary_model: BinaryModel | None = None,
+    wire: Wire | None = None,
 ) -> None:
     """Try to register RE-specific tools. Silently skip if dependencies missing."""
 

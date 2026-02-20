@@ -184,7 +184,7 @@ async def compact_context(
     context.messages = [summary_msg] + recent_messages
 
     # Rewrite the JSONL file
-    await context._rewrite_jsonl()
+    await context.rewrite()
 
     return summary
 

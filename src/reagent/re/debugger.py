@@ -12,12 +12,13 @@ tools operate on that session by ID.
 from __future__ import annotations
 
 import asyncio
+import enum
 import logging
 import os
 import re
 import shutil
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from pydantic import BaseModel, Field
@@ -25,7 +26,6 @@ from pydantic import BaseModel, Field
 from reagent.pty.manager import PTYManager
 from reagent.pty.session import PTYSession
 from reagent.tool.base import BaseTool, ToolError, ToolOk, ToolResult
-from reagent.tool.truncation import strip_ansi
 
 logger = logging.getLogger(__name__)
 
@@ -35,19 +35,19 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-class DebuggerType:
+class DebuggerType(enum.StrEnum):
     GDB = "gdb"
     LLDB = "lldb"
 
 
 # Prompt patterns for detecting when the debugger is ready
-_PROMPT_PATTERNS = {
+_PROMPT_PATTERNS: dict[DebuggerType, str] = {
     DebuggerType.GDB: r"\(gdb\)\s*$",
     DebuggerType.LLDB: r"\(lldb\)\s*$",
 }
 
 # Command translation: abstract -> debugger-specific
-_CMD_MAP = {
+_CMD_MAP: dict[DebuggerType, dict[str, str]] = {
     DebuggerType.GDB: {
         "run": "run",
         "continue": "continue",
@@ -92,6 +92,16 @@ _CMD_MAP = {
 }
 
 
+def _xml_wrap(tag: str, content: str, **attrs: str) -> str:
+    """Wrap content in an XML tag with optional attributes.
+
+    Provides structural cues to the LLM so it can reliably parse
+    debug tool output (inspired by opencode-pty's XML-tagged responses).
+    """
+    attr_str = "".join(f' {k}="{v}"' for k, v in attrs.items())
+    return f"<{tag}{attr_str}>\n{content}\n</{tag}>"
+
+
 def _detect_debugger() -> str | None:
     """Detect available debugger, preferring LLDB on macOS."""
     import platform
@@ -122,7 +132,7 @@ class DebugSessionInfo:
 
     session_id: str
     pty_session: PTYSession
-    debugger_type: str
+    debugger_type: DebuggerType
     binary_path: str
     prompt_pattern: re.Pattern
 
@@ -242,17 +252,19 @@ class DebugSessionRegistry:
         with self._lock:
             info = self._sessions.pop(session_id, None)
         if info:
-            # Try graceful quit first
+            # Try graceful quit first via the PTY send API
             try:
                 if info.pty_session.alive:
-                    os.write(info.pty_session._master_fd, b"quit\n")
+                    await info.pty_session.send("quit", timeout=2.0)
                     await asyncio.sleep(0.3)
                     if info.pty_session.alive:
                         # Force confirm quit (GDB asks "Quit anyway?")
-                        os.write(info.pty_session._master_fd, b"y\n")
+                        await info.pty_session.send("y", timeout=2.0)
                         await asyncio.sleep(0.2)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(
+                    "Error during graceful debugger quit for %s: %s", session_id, e
+                )
             # Force kill via PTY manager
             await self._pty_manager.kill(session_id)
 
@@ -300,13 +312,17 @@ class DebugSessionRegistry:
         timeout: float = 10.0,
     ) -> None:
         """Wait for the debugger prompt to appear in the output."""
-        deadline = asyncio.get_event_loop().time() + timeout
-        while asyncio.get_event_loop().time() < deadline:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
             tail = pty_session.buffer.read_tail(5)
             for line in tail:
                 if prompt_pattern.search(line):
                     return
-            await asyncio.sleep(0.1)
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            await pty_session.buffer.wait_for_data(timeout=min(remaining, 0.5))
         logger.warning("Timed out waiting for debugger prompt")
 
 
@@ -396,7 +412,12 @@ class DebugLaunchTool(BaseTool[DebugLaunchParams]):
             )
 
             return ToolOk(
-                output="\n".join(output_parts),
+                output=_xml_wrap(
+                    "debug_launched",
+                    "\n".join(output_parts),
+                    session_id=info.session_id,
+                    debugger=info.debugger_type,
+                ),
                 brief=f"debug session {info.session_id} ({info.debugger_type})",
             )
         except Exception as e:
@@ -451,7 +472,13 @@ class DebugBreakpointTool(BaseTool[DebugBreakpointParams]):
                     {"number": params.location},
                 )
                 return ToolOk(
-                    output=output or "Breakpoint deleted.",
+                    output=_xml_wrap(
+                        "debug_output",
+                        output or "Breakpoint deleted.",
+                        session_id=params.session_id,
+                        action="breakpoint_delete",
+                        location=params.location,
+                    ),
                     brief=f"deleted breakpoint {params.location}",
                 )
 
@@ -479,7 +506,13 @@ class DebugBreakpointTool(BaseTool[DebugBreakpointParams]):
                     )
 
             return ToolOk(
-                output=output or "Breakpoint set.",
+                output=_xml_wrap(
+                    "debug_output",
+                    output or "Breakpoint set.",
+                    session_id=params.session_id,
+                    action="breakpoint_set",
+                    location=params.location,
+                ),
                 brief=f"breakpoint @ {params.location}",
             )
         except Exception as e:
@@ -535,7 +568,12 @@ class DebugContinueTool(BaseTool[DebugContinueParams]):
                 timeout=60.0,  # Execution may take a while
             )
             return ToolOk(
-                output=output or f"({params.action} completed)",
+                output=_xml_wrap(
+                    "debug_output",
+                    output or f"({params.action} completed)",
+                    session_id=params.session_id,
+                    action=params.action,
+                ),
                 brief=f"{params.action}",
             )
         except Exception as e:
@@ -578,7 +616,15 @@ class DebugRegistersTool(BaseTool[DebugRegistersParams]):
                     output="No register data. Is the program stopped at a breakpoint?",
                     brief="no registers (not stopped?)",
                 )
-            return ToolOk(output=output, brief="registers")
+            return ToolOk(
+                output=_xml_wrap(
+                    "debug_output",
+                    output,
+                    session_id=params.session_id,
+                    action=cmd,
+                ),
+                brief="registers",
+            )
         except Exception as e:
             return ToolError(output=f"Failed to read registers: {e}")
 
@@ -661,7 +707,15 @@ class DebugMemoryTool(BaseTool[DebugMemoryParams]):
                     brief="memory read failed",
                 )
             return ToolOk(
-                output=output,
+                output=_xml_wrap(
+                    "debug_output",
+                    output,
+                    session_id=params.session_id,
+                    action="memory_read",
+                    address=params.address,
+                    count=str(params.count),
+                    format=params.format,
+                ),
                 brief=f"memory @ {params.address} ({params.count} {params.format})",
             )
         except Exception as e:
@@ -704,7 +758,15 @@ class DebugBacktraceTool(BaseTool[DebugBacktraceParams]):
                     output="No backtrace. Is the program stopped at a breakpoint?",
                     brief="no backtrace",
                 )
-            return ToolOk(output=output, brief="backtrace")
+            return ToolOk(
+                output=_xml_wrap(
+                    "debug_output",
+                    output,
+                    session_id=params.session_id,
+                    action=cmd,
+                ),
+                brief="backtrace",
+            )
         except Exception as e:
             return ToolError(output=f"Backtrace failed: {e}")
 
@@ -746,7 +808,13 @@ class DebugEvalTool(BaseTool[DebugEvalParams]):
                 params.session_id, params.command
             )
             return ToolOk(
-                output=output or "(no output)",
+                output=_xml_wrap(
+                    "debug_output",
+                    output or "(no output)",
+                    session_id=params.session_id,
+                    action="eval",
+                    command=params.command,
+                ),
                 brief=f"eval: {params.command[:50]}",
             )
         except Exception as e:
@@ -783,7 +851,11 @@ class DebugKillTool(BaseTool[DebugKillParams]):
 
             await self._registry.kill(params.session_id)
             return ToolOk(
-                output=f"Debug session '{params.session_id}' terminated.",
+                output=_xml_wrap(
+                    "debug_killed",
+                    f"Debug session '{params.session_id}' terminated.",
+                    session_id=params.session_id,
+                ),
                 brief=f"killed {params.session_id}",
             )
         except Exception as e:
@@ -817,7 +889,11 @@ class DebugSessionsTool(BaseTool[DebugSessionsParams]):
         sessions = self._registry.list_sessions()
         if not sessions:
             return ToolOk(
-                output="No active debug sessions. Use debug_launch to start one.",
+                output=_xml_wrap(
+                    "debug_sessions",
+                    "No active debug sessions. Use debug_launch to start one.",
+                    count="0",
+                ),
                 brief="0 debug sessions",
             )
 
@@ -829,7 +905,11 @@ class DebugSessionsTool(BaseTool[DebugSessionsParams]):
             )
 
         return ToolOk(
-            output="\n".join(lines),
+            output=_xml_wrap(
+                "debug_sessions",
+                "\n".join(lines),
+                count=str(len(sessions)),
+            ),
             brief=f"{len(sessions)} debug session(s)",
         )
 

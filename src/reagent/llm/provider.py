@@ -24,9 +24,23 @@ Normalized chunk format (same as before):
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from collections.abc import AsyncIterator
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+    before_sleep_log,
+)
+
+if TYPE_CHECKING:
+    from litellm import CustomStreamWrapper, ModelResponse, ModelResponseStream
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -109,21 +123,34 @@ class LiteLLMProvider:
 
         # Reasoning effort (provider-agnostic via litellm)
         if self._config.reasoning_effort:
-            import litellm as _litellm
-
             # Enable modify_params so litellm auto-handles the case where
             # thinking_blocks are missing from prior assistant messages
             # (e.g. after tool call round-trips through OpenAI-compat clients).
-            _litellm.modify_params = True
+            # NOTE: This is a global side-effect on litellm's module state.
+            litellm.modify_params = True
             kwargs["reasoning_effort"] = self._config.reasoning_effort
 
-        response = await litellm.acompletion(**kwargs)
+        response = await _acompletion_with_retry(**kwargs)
 
         async for chunk in response:  # type: ignore[union-attr]
             yield _chunk_to_dict(chunk)
 
 
-def _chunk_to_dict(chunk: Any) -> dict[str, Any]:
+@retry(
+    retry=retry_if_exception_type((ConnectionError, TimeoutError, OSError)),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=30),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True,
+)
+async def _acompletion_with_retry(**kwargs: Any) -> CustomStreamWrapper | ModelResponse:
+    """Call litellm.acompletion with retry on transient errors."""
+    import litellm
+
+    return await litellm.acompletion(**kwargs)
+
+
+def _chunk_to_dict(chunk: ModelResponseStream) -> dict[str, Any]:
     """Convert a litellm ModelResponseStream chunk to our normalized dict.
 
     litellm chunks have the same shape as OpenAI ChatCompletionChunk objects:
